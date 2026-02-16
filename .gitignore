@@ -1,0 +1,5 @@
+/target
+.cache/
+divergences.geojson
+*.gdb.zip
+.claude/
