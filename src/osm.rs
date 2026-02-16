@@ -6,6 +6,11 @@ use std::path::Path;
 
 const OSM_API_BASE: &str = "https://api.openstreetmap.org/api/0.6";
 
+pub enum FetchProgress {
+    SubRelationsFound(usize),
+    SubRelationFetched(u64),
+}
+
 #[derive(Debug, Deserialize)]
 struct RelationResponse {
     elements: Vec<Element>,
@@ -49,7 +54,11 @@ struct RelationMember {
 }
 
 /// Fetch all OSM linestrings for a relation, using cached responses when available.
-pub fn fetch_relation_ways(relation_id: u64, cache_dir: &Path) -> Result<Vec<LineString<f64>>> {
+pub fn fetch_relation_ways(
+    relation_id: u64,
+    cache_dir: &Path,
+    on_progress: Option<&dyn Fn(FetchProgress)>,
+) -> Result<Vec<LineString<f64>>> {
     std::fs::create_dir_all(cache_dir)?;
     let client = reqwest::blocking::Client::builder()
         .user_agent("pct-diff/0.1 (PCT reroute detection tool)")
@@ -77,23 +86,14 @@ pub fn fetch_relation_ways(relation_id: u64, cache_dir: &Path) -> Result<Vec<Lin
         .map(|m| m.member_ref)
         .collect();
 
-    eprintln!(
-        "Found {} sub-relations for relation {}",
-        sub_relation_ids.len(),
-        relation_id
-    );
+    if let Some(cb) = &on_progress {
+        cb(FetchProgress::SubRelationsFound(sub_relation_ids.len()));
+    }
 
     // Step 2: Fetch each sub-relation's full data
     let mut all_lines = Vec::new();
 
-    for (i, &sub_id) in sub_relation_ids.iter().enumerate() {
-        eprintln!(
-            "Fetching sub-relation {}/{}: {}",
-            i + 1,
-            sub_relation_ids.len(),
-            sub_id
-        );
-
+    for &sub_id in &sub_relation_ids {
         let full_json = fetch_cached(
             &client,
             &format!("{}/relation/{}/full.json", OSM_API_BASE, sub_id),
@@ -104,9 +104,12 @@ pub fn fetch_relation_ways(relation_id: u64, cache_dir: &Path) -> Result<Vec<Lin
             .with_context(|| format!("Failed to parse full response for relation {}", sub_id))?;
 
         all_lines.extend(lines);
+
+        if let Some(cb) = &on_progress {
+            cb(FetchProgress::SubRelationFetched(sub_id));
+        }
     }
 
-    eprintln!("Total OSM ways: {}", all_lines.len());
     Ok(all_lines)
 }
 
@@ -117,11 +120,9 @@ fn fetch_cached(
     cache_path: &Path,
 ) -> Result<String> {
     if cache_path.exists() {
-        eprintln!("  Using cached: {}", cache_path.display());
         return std::fs::read_to_string(cache_path).context("Failed to read cache file");
     }
 
-    eprintln!("  Fetching: {}", url);
     let response = client.get(url).send()?.error_for_status()?;
     let body = response.text()?;
 

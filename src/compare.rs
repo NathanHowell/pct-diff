@@ -1,5 +1,7 @@
 use geo::{Coord, Haversine, Line, LineString, MultiLineString, Point};
 use geo::{Distance, Length};
+use indicatif::ProgressBar;
+use rayon::prelude::*;
 use rstar::{PointDistance, RTree, RTreeObject, AABB};
 
 /// A single OSM line segment stored in the R-tree.
@@ -69,14 +71,17 @@ fn haversine_point_to_segment(point: Coord<f64>, seg_start: Coord<f64>, seg_end:
 }
 
 /// Build an R-tree index from OSM linestrings.
-pub fn build_index(osm_lines: &[LineString<f64>]) -> RTree<IndexedSegment> {
+pub fn build_index(osm_lines: &[LineString<f64>], progress: Option<&ProgressBar>) -> RTree<IndexedSegment> {
     let segments: Vec<IndexedSegment> = osm_lines
-        .iter()
-        .flat_map(|ls| {
+        .par_iter()
+        .flat_map_iter(|ls| {
             ls.lines()
                 .map(|line| IndexedSegment::new(line.start, line.end))
         })
         .collect();
+    if let Some(pb) = progress {
+        pb.set_message(format!("Building R-tree from {} segments...", segments.len()));
+    }
     RTree::bulk_load(segments)
 }
 
@@ -135,6 +140,53 @@ fn sample_along(ls: &LineString<f64>, interval_m: f64) -> Vec<Coord<f64>> {
     samples
 }
 
+/// Process a single linestring to find divergent segments.
+fn process_linestring(
+    ls: &LineString<f64>,
+    section_name: &str,
+    osm_index: &RTree<IndexedSegment>,
+    threshold_m: f64,
+    min_length_m: f64,
+    sample_interval_m: f64,
+) -> Vec<Divergence> {
+    let samples = sample_along(ls, sample_interval_m);
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    // Compute distances for each sample in parallel
+    let distances: Vec<(Coord<f64>, f64)> = samples
+        .par_iter()
+        .map(|&coord| {
+            let point = [coord.x, coord.y];
+            let dist = osm_index
+                .nearest_neighbor(&point)
+                .map(|seg| haversine_point_to_segment(coord, seg.line.start, seg.line.end))
+                .unwrap_or(f64::MAX);
+            (coord, dist)
+        })
+        .collect();
+
+    // State machine to detect contiguous divergent runs (sequential — order-dependent)
+    let mut divergences = Vec::new();
+    let mut run_start: Option<usize> = None;
+
+    for i in 0..=distances.len() {
+        let divergent = i < distances.len() && distances[i].1 > threshold_m;
+
+        if divergent && run_start.is_none() {
+            run_start = Some(i);
+        } else if !divergent && run_start.is_some() {
+            let start = run_start.unwrap();
+            let run = &distances[start..i];
+            emit_divergence(run, section_name, min_length_m, &mut divergences);
+            run_start = None;
+        }
+    }
+
+    divergences
+}
+
 /// Find divergent segments between PCTA sections and the OSM index.
 pub fn find_divergences(
     pcta_sections: &[PctaSection],
@@ -142,48 +194,32 @@ pub fn find_divergences(
     threshold_m: f64,
     min_length_m: f64,
     sample_interval_m: f64,
+    progress: Option<&ProgressBar>,
 ) -> Vec<Divergence> {
-    let mut divergences = Vec::new();
-
-    for section in pcta_sections {
-        for ls in &section.geometry.0 {
-            let samples = sample_along(ls, sample_interval_m);
-            if samples.is_empty() {
-                continue;
-            }
-
-            // Compute distances for each sample
-            let distances: Vec<(Coord<f64>, f64)> = samples
+    pcta_sections
+        .par_iter()
+        .flat_map_iter(|section| {
+            let divs: Vec<Divergence> = section
+                .geometry
+                .0
                 .iter()
-                .map(|&coord| {
-                    let point = [coord.x, coord.y];
-                    let dist = osm_index
-                        .nearest_neighbor(&point)
-                        .map(|seg| haversine_point_to_segment(coord, seg.line.start, seg.line.end))
-                        .unwrap_or(f64::MAX);
-                    (coord, dist)
+                .flat_map(|ls| {
+                    process_linestring(
+                        ls,
+                        &section.section_name,
+                        osm_index,
+                        threshold_m,
+                        min_length_m,
+                        sample_interval_m,
+                    )
                 })
                 .collect();
-
-            // State machine to detect contiguous divergent runs
-            let mut run_start: Option<usize> = None;
-
-            for i in 0..=distances.len() {
-                let divergent = i < distances.len() && distances[i].1 > threshold_m;
-
-                if divergent && run_start.is_none() {
-                    run_start = Some(i);
-                } else if !divergent && run_start.is_some() {
-                    let start = run_start.unwrap();
-                    let run = &distances[start..i];
-                    emit_divergence(run, &section.section_name, min_length_m, &mut divergences);
-                    run_start = None;
-                }
+            if let Some(pb) = progress {
+                pb.inc(1);
             }
-        }
-    }
-
-    divergences
+            divs
+        })
+        .collect()
 }
 
 fn emit_divergence(
@@ -240,10 +276,10 @@ mod tests {
     fn identical_lines_no_divergences() {
         let line = horizontal_line(-118.0, 34.0, 100, 0.001);
         let osm_lines = vec![line.clone()];
-        let index = build_index(&osm_lines);
+        let index = build_index(&osm_lines, None);
         let sections = vec![make_section("Test", line)];
 
-        let divs = find_divergences(&sections, &index, 10.0, 500.0, 25.0);
+        let divs = find_divergences(&sections, &index, 10.0, 500.0, 25.0, None);
         assert!(divs.is_empty(), "Identical lines should produce no divergences");
     }
 
@@ -252,11 +288,11 @@ mod tests {
         // ~50m apart at 34°N latitude: 50m / 111320m per degree ≈ 0.000449 degrees
         let pcta_line = horizontal_line(-118.0, 34.0, 200, 0.001);
         let osm_line = horizontal_line(-118.0, 34.0 + 0.000449, 200, 0.001);
-        let index = build_index(&vec![osm_line]);
+        let index = build_index(&vec![osm_line], None);
         let sections = vec![make_section("Test", pcta_line)];
 
         // threshold 100m, these are ~50m apart
-        let divs = find_divergences(&sections, &index, 100.0, 500.0, 25.0);
+        let divs = find_divergences(&sections, &index, 100.0, 500.0, 25.0, None);
         assert!(divs.is_empty(), "Lines ~50m apart should not diverge at 100m threshold");
     }
 
@@ -265,10 +301,10 @@ mod tests {
         // ~200m apart: 200m / 111320 ≈ 0.001797 degrees
         let pcta_line = horizontal_line(-118.0, 34.0, 500, 0.0005);
         let osm_line = horizontal_line(-118.0, 34.0 + 0.001797, 500, 0.0005);
-        let index = build_index(&vec![osm_line]);
+        let index = build_index(&vec![osm_line], None);
         let sections = vec![make_section("Test", pcta_line)];
 
-        let divs = find_divergences(&sections, &index, 100.0, 500.0, 25.0);
+        let divs = find_divergences(&sections, &index, 100.0, 500.0, 25.0, None);
         assert!(!divs.is_empty(), "Lines ~200m apart should diverge at 100m threshold");
         assert_eq!(divs.len(), 1);
         assert!(divs[0].max_distance_m > 100.0);
@@ -298,10 +334,10 @@ mod tests {
 
         let pcta_line = LineString::from(pcta_coords);
         let osm_line = LineString::from(osm_coords);
-        let index = build_index(&vec![osm_line]);
+        let index = build_index(&vec![osm_line], None);
         let sections = vec![make_section("Test", pcta_line)];
 
-        let divs = find_divergences(&sections, &index, 100.0, 500.0, 25.0);
+        let divs = find_divergences(&sections, &index, 100.0, 500.0, 25.0, None);
         assert!(!divs.is_empty(), "Should detect the middle divergence");
     }
 
@@ -329,10 +365,10 @@ mod tests {
 
         let pcta_line = LineString::from(pcta_coords);
         let osm_line = LineString::from(osm_coords);
-        let index = build_index(&vec![osm_line]);
+        let index = build_index(&vec![osm_line], None);
         let sections = vec![make_section("Test", pcta_line)];
 
-        let divs = find_divergences(&sections, &index, 100.0, 500.0, 25.0);
+        let divs = find_divergences(&sections, &index, 100.0, 500.0, 25.0, None);
         assert!(divs.is_empty(), "Short divergence should be filtered out");
     }
 
@@ -359,25 +395,25 @@ mod tests {
 
         let pcta_line = LineString::from(pcta_coords);
         let osm_line = LineString::from(osm_coords);
-        let index = build_index(&vec![osm_line]);
+        let index = build_index(&vec![osm_line], None);
         let sections = vec![make_section("Test", pcta_line)];
 
-        let divs = find_divergences(&sections, &index, 100.0, 500.0, 25.0);
+        let divs = find_divergences(&sections, &index, 100.0, 500.0, 25.0, None);
         assert!(divs.len() >= 2, "Should detect two separate divergences, got {}", divs.len());
     }
 
     #[test]
     fn empty_inputs_no_panics() {
-        let index = build_index(&[]);
+        let index = build_index(&[], None);
         let sections: Vec<PctaSection> = vec![];
-        let divs = find_divergences(&sections, &index, 100.0, 500.0, 25.0);
+        let divs = find_divergences(&sections, &index, 100.0, 500.0, 25.0, None);
         assert!(divs.is_empty());
 
         // Non-empty sections but empty index
         let line = horizontal_line(-118.0, 34.0, 10, 0.001);
         let sections = vec![make_section("Test", line)];
-        let index = build_index(&[]);
-        let divs = find_divergences(&sections, &index, 100.0, 500.0, 25.0);
+        let index = build_index(&[], None);
+        let divs = find_divergences(&sections, &index, 100.0, 500.0, 25.0, None);
         // With empty index, every point has MAX distance, so everything is divergent
         // This should not panic
         let _ = divs;

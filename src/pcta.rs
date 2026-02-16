@@ -15,19 +15,6 @@ pub fn load_pcta_gdb(path: &Path) -> Result<Vec<PctaSection>> {
         .layer(0)
         .context("Failed to get first layer from GDB")?;
 
-    let layer_name = layer.name();
-    eprintln!(
-        "Reading PCTA layer: {} ({} features)",
-        layer_name,
-        layer.feature_count()
-    );
-
-    // Discover field names
-    let defn = layer.defn();
-    for field in defn.fields() {
-        eprintln!("  Field: {}", field.name());
-    }
-
     let mut sections = Vec::new();
 
     for feature in layer.features() {
@@ -56,7 +43,6 @@ pub fn load_pcta_gdb(path: &Path) -> Result<Vec<PctaSection>> {
         });
     }
 
-    eprintln!("Loaded {} PCTA sections", sections.len());
     Ok(sections)
 }
 

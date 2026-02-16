@@ -1,9 +1,11 @@
 use anyhow::Result;
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use pct_diff::compare::{build_index, find_divergences};
-use pct_diff::osm::fetch_relation_ways;
+use pct_diff::osm::{fetch_relation_ways, FetchProgress};
 use pct_diff::output::to_geojson;
 use pct_diff::pcta::load_pcta_gdb;
 
@@ -42,27 +44,56 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    eprintln!("Loading PCTA data from {}...", cli.pcta.display());
+    let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}").unwrap();
+    let bar_style = ProgressStyle::with_template("{spinner:.cyan} {msg} [{bar:40}] {pos}/{len}")
+        .unwrap()
+        .progress_chars("=> ");
+
+    // Load PCTA data
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(spinner_style.clone());
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb.set_message(format!("Loading PCTA data from {}...", cli.pcta.display()));
     let pcta_sections = load_pcta_gdb(&cli.pcta)?;
+    pb.finish_with_message(format!("Loaded {} PCTA sections", pcta_sections.len()));
 
-    eprintln!("Fetching OSM relation {}...", cli.relation);
-    let osm_lines = fetch_relation_ways(cli.relation, &cli.cache_dir)?;
+    // Fetch OSM data
+    let pb = ProgressBar::new(0);
+    pb.set_style(bar_style.clone());
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb.set_message(format!("Fetching OSM relation {}...", cli.relation));
+    let osm_lines = fetch_relation_ways(cli.relation, &cli.cache_dir, Some(&|event| match event {
+        FetchProgress::SubRelationsFound(count) => pb.set_length(count as u64),
+        FetchProgress::SubRelationFetched(_) => pb.inc(1),
+    }))?;
+    pb.finish_with_message(format!("Fetched {} OSM ways", osm_lines.len()));
 
-    eprintln!("Building spatial index ({} OSM segments)...", osm_lines.len());
-    let index = build_index(&osm_lines);
+    // Build spatial index
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(spinner_style);
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb.set_message("Building spatial index...");
+    let index = build_index(&osm_lines, Some(&pb));
+    pb.finish_with_message("Spatial index built");
 
-    eprintln!("Comparing geometries...");
+    // Find divergences
+    let pb = ProgressBar::new(pcta_sections.len() as u64);
+    pb.set_style(bar_style);
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb.set_message("Comparing geometries...");
     let divergences = find_divergences(
         &pcta_sections,
         &index,
         cli.threshold,
         cli.min_length,
         cli.sample_interval,
+        Some(&pb),
     );
+    pb.finish_with_message(format!("Found {} divergent segments", divergences.len()));
 
-    eprintln!("Found {} divergent segments", divergences.len());
+    // Results summary
     for d in &divergences {
-        eprintln!(
+        println!(
             "  {} - {:.0}m long, max {:.0}m, mean {:.0}m off",
             d.section_name, d.length_m, d.max_distance_m, d.mean_distance_m
         );
@@ -71,7 +102,7 @@ fn main() -> Result<()> {
     let geojson = to_geojson(&divergences);
     let json = serde_json::to_string_pretty(&geojson)?;
     std::fs::write(&cli.output, json)?;
-    eprintln!("Wrote {}", cli.output.display());
+    println!("Wrote {}", cli.output.display());
 
     Ok(())
 }
